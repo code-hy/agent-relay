@@ -100,3 +100,172 @@ running tests against another database.
 This starter intentionally does not include Docker, Kubernetes, CI, external
 brokers, an LLM, or a PostgreSQL implementation. Those are deployment and
 student-port concerns rather than part of the local relay protocol.
+
+## Homework 3: containerise and deploy (step-by-step)
+
+This section documents the exact steps performed for HW3 in this repo.
+
+### Q1: Understand the project
+
+Answer: **Agents claim tasks from a DB through an HTTP API.**
+
+Why: `SPEC.md` defines a Relay API backed by a database (SQLite starter,
+PostgreSQL port); `main.py` exposes `POST /api/v1/tasks/claim` and terminal
+endpoints; `storage.py:claim_one()` moves one `queued` task to `processing`
+with a leased delivery attempt. There is no broker and no direct
+agent-to-agent channel; the dashboard only reads through the API.
+
+Run it:
+
+```bash
+uv sync
+uv run uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+### Q2: Register agents and test the task flow
+
+Answer: the sender sees **`completed`** after the recipient submits its result.
+
+Flow performed against the live API:
+
+1. `POST /api/v1/agents` as `alice-sender`, keep `token`.
+2. `POST /api/v1/agents` as `bob-worker`, keep `token`.
+3. Sender: `POST /api/v1/tasks` with `{"to": "<bob id>", "input": "..."}` → `queued`.
+4. Recipient: `POST /api/v1/tasks/claim` → `200` with `claim_token`.
+5. Recipient: `POST /api/v1/tasks/{id}/complete` with that `claim_token`.
+6. Sender: `GET /api/v1/tasks/{id}` → `status: completed`.
+7. `GET /` returns the dashboard (200).
+
+This is codified in `test_integration_task_flow.py`
+(`test_q2_two_agents_exchange_task_and_result`), which runs against the real
+API + DB and asserts the sender-visible status is `completed`:
+
+```bash
+uv run pytest test_integration_task_flow.py test_agent_relay.py -q
+# 5 passed
+```
+
+### Q3: Containerization
+
+Answer: **`-p`** publishes a container port to the host.
+
+`Dockerfile` builds a slim runtime image and binds uvicorn to all interfaces
+(otherwise `-p` looks broken because uvicorn defaults to `127.0.0.1`):
+
+```dockerfile
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+Build and run:
+
+```bash
+docker build -t agent-relay:local .
+docker run -d --name agent-relay-test -p 8000:8000 agent-relay:local
+```
+
+The Q2 flow was repeated against `http://127.0.0.1:8000` on the containerized
+API (register → send → claim → complete → sender sees `completed`, dashboard
+200). Cleanup: `docker rm -f agent-relay-test`.
+
+### Q4: Docker Compose and PostgreSQL
+
+Answer: the API must use hostname **`postgres`** (the Compose service name).
+
+`database.py:immediate_transaction()` branches: SQLite keeps `BEGIN
+IMMEDIATE`; PostgreSQL falls back to a normal session transaction.
+`storage.py:claim_one()` adds `FOR UPDATE SKIP LOCKED` on PostgreSQL so
+concurrent workers skip locked rows.
+
+`compose.yaml` runs both services:
+
+- `postgres` (`postgres:16-alpine`, `pgdata` volume, `pg_isready` healthcheck)
+- `api` (`build: .`, `RELAY_DATABASE_URL=postgresql+psycopg://relay:relay@postgres:5432/relay`,
+  `depends_on: postgres healthy`)
+
+Run and verify:
+
+```bash
+docker compose up --build -d
+# repeat the Q2 flow against http://127.0.0.1:8000
+docker compose exec postgres psql -U relay -d relay -c "SELECT id, status FROM tasks;"
+docker compose down
+```
+
+The task row is stored in PostgreSQL (`completed`), confirming the app no
+longer uses SQLite in this stack.
+
+### Q5: Deploy to Kubernetes (kind)
+
+Answer: a **`Deployment`** keeps the requested replica count running and
+manages updates.
+
+Manifests in `k8s/`:
+
+- `postgres-pvc.yaml` — 1Gi `ReadWriteOnce` persistent storage
+- `postgres-deployment.yaml` — `postgres:16-alpine`, PVC mount,
+  `pg_isready` readiness/liveness probes
+- `postgres-service.yaml` — `ClusterIP` on 5432
+- `api-deployment.yaml` — `replicas: 2`, `imagePullPolicy: Never`,
+  `RELAY_DATABASE_URL=...@postgres:5432/relay`, readiness `/ready`,
+  liveness `/health`, RollingUpdate strategy
+- `api-service.yaml` — `ClusterIP` on 8000
+
+Deploy:
+
+```bash
+kind load docker-image agent-relay:local --name kind
+kubectl apply -f k8s/
+kubectl get pvc,pods,svc,deploy   # postgres Bound/Running, agent-relay 2/2 Available
+kubectl port-forward svc/agent-relay 8000:8000
+# repeat the Q2 flow against http://127.0.0.1:8000 -> sender sees completed
+```
+
+Note: API pods may `CrashLoopBackOff` once if they start before PostgreSQL is
+ready (`init_db()` runs at import); they become `1/1 Running` after restart
+once postgres is healthy.
+
+### Q6: CI/CD (act + v2)
+
+Answer: if a test fails, **keep the existing version running and stop the
+deployment** (deploy only runs when tests pass).
+
+`.github/workflows/ci.yml`:
+
+- `test` — postgres service, install deps, `pytest test_agent_relay.py
+  test_integration_task_flow.py` with
+  `RELAY_DATABASE_URL=postgresql+psycopg://relay:relay@localhost:5432/relay`
+- `build-and-deploy` — `needs: test`; builds `agent-relay:$GITHUB_SHA`
+  (unique tag per version), `kind load docker-image`, `kubectl set image`,
+  `kubectl rollout status --timeout=180s`
+
+Run locally with act (stop any host process on 5432 first, e.g. an unrelated
+local postgres, because the postgres service maps 5432):
+
+```bash
+act -j test -P ubuntu-latest=catthehacker/ubuntu:act-latest
+# 5 passed against PostgreSQL, Job succeeded
+```
+
+v2 release:
+
+1. Change `dashboard.html:18` to `<h1>Agent Relay v2</h1>`.
+2. Re-run local `pytest` and `act -j test` (both pass).
+3. Build/load/roll out the new tag and wait:
+
+```bash
+docker build -t agent-relay:v2 .
+kind load docker-image agent-relay:v2 --name kind
+kubectl set image deployment/agent-relay api=agent-relay:v2
+kubectl rollout status deployment/agent-relay --timeout=180s
+kubectl port-forward svc/agent-relay 8000:8000
+# GET / contains <h1>Agent Relay v2</h1>; task flow still returns completed
+```
+
+### Homework answers (summary)
+
+1. Agents claim tasks from a DB through an HTTP API.
+2. `completed`
+3. `-p`
+4. `postgres`
+5. `Deployment`
+6. Keep the existing version running and stop the deployment.
